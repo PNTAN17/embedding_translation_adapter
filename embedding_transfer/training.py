@@ -57,10 +57,7 @@ class AlignmentLoss(nn.Module):
         target = F.normalize(target, dim=-1)
         logits = prediction @ target.T / temperature
         labels = torch.arange(prediction.size(0), device=prediction.device)
-        return (
-            F.cross_entropy(logits, labels)
-            + F.cross_entropy(logits.T, labels)
-        ) / 2
+        return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
 
     @staticmethod
     def _greedy_token_loss(
@@ -82,9 +79,7 @@ class AlignmentLoss(nn.Module):
         precision = (precision * prediction_weights).sum(1) / prediction_weights.sum(
             1
         ).clamp(min=1.0)
-        recall = (recall * target_weights).sum(1) / target_weights.sum(1).clamp(
-            min=1.0
-        )
+        recall = (recall * target_weights).sum(1) / target_weights.sum(1).clamp(min=1.0)
         score = 2 * precision * recall / (precision + recall + 1e-8)
         return (1 - score).mean()
 
@@ -100,6 +95,21 @@ class AlignmentLoss(nn.Module):
                 f"Alignment tensors must have equal shapes, got "
                 f"{tuple(prediction.shape)} and {tuple(target.shape)}."
             )
+        if prediction.ndim != 3 or prediction.shape[-1] < 2:
+            raise ValueError(
+                "Alignment requires batch, sequence, and at least two features"
+            )
+        for mask in (prediction_mask, target_mask):
+            if (
+                mask.shape != prediction.shape[:2]
+                or not ((mask == 0) | (mask == 1)).all()
+                or (mask.sum(1) == 0).any()
+            ):
+                raise ValueError(
+                    "Alignment masks must be binary and contain a valid token in every row"
+                )
+        # Variances and squared errors can overflow in float16 under autocast.
+        prediction, target = prediction.float(), target.float()
         lengths = torch.maximum(prediction_mask.sum(1), target_mask.sum(1))
         lengths = lengths.clamp(min=1, max=prediction.size(1))
         positions = torch.arange(prediction.size(1), device=prediction.device)
@@ -108,9 +118,7 @@ class AlignmentLoss(nn.Module):
 
         token_error = ((prediction - target) ** 2).mean(-1)
         token_mse = (token_error * valid_float).sum(1) / lengths
-        variance_error = (
-            prediction.var(dim=-1) - target.var(dim=-1)
-        ) ** 2
+        variance_error = (prediction.var(dim=-1) - target.var(dim=-1)) ** 2
         token_variance = (variance_error * valid_float).sum(1) / lengths
         token_loss = token_mse.mean() + 0.5 * token_variance.mean()
 
@@ -123,9 +131,7 @@ class AlignmentLoss(nn.Module):
             self._sentence_variance(target, target_pooled, common_mask),
         )
         sentence_loss = sentence_mean + 0.5 * sentence_variance
-        cosine_loss = (
-            1 - F.cosine_similarity(prediction_pooled, target_pooled)
-        ).mean()
+        cosine_loss = (1 - F.cosine_similarity(prediction_pooled, target_pooled)).mean()
 
         return (
             self.token_mse_weight * token_loss
@@ -134,9 +140,7 @@ class AlignmentLoss(nn.Module):
             * self._contrastive(prediction_pooled, target_pooled)
             + self.cosine_weight * cosine_loss
             + self.greedy_token_weight
-            * self._greedy_token_loss(
-                prediction, target, prediction_mask, target_mask
-            )
+            * self._greedy_token_loss(prediction, target, prediction_mask, target_mask)
         )
 
 
@@ -172,11 +176,19 @@ def load_parallel_jsonl(path: str | Path) -> list[dict]:
     result = []
     for index, record in enumerate(_read_jsonl(path), 1):
         source = f"{Path(path).name} record {index}"
-        result.append({"vi": _text(record, "vi", source), "en": _text(record, "en", source)})
+        result.append(
+            {
+                "vi": _text(record, "vi", source),
+                "en": _text(record, "en", source),
+                **({"id": record["id"]} if "id" in record else {}),
+            }
+        )
     return result
 
 
 def load_mocheg_jsonl(path: str | Path, max_evidence: int = 5) -> list[dict]:
+    if not 1 <= max_evidence <= 5:
+        raise ValueError("max_evidence must lie between one and five")
     result = []
     for index, record in enumerate(_read_jsonl(path), 1):
         source = f"{Path(path).name} record {index}"
@@ -192,13 +204,17 @@ def load_mocheg_jsonl(path: str | Path, max_evidence: int = 5) -> list[dict]:
         ):
             pair_source = f"{source} evidence {position}"
             pairs.append(
-                {"vi": _text({"vi": vi}, "vi", pair_source), "en": _text({"en": en}, "en", pair_source)}
+                {
+                    "vi": _text({"vi": vi}, "vi", pair_source),
+                    "en": _text({"en": en}, "en", pair_source),
+                }
             )
         result.append(
             {
                 "vi": _text(record, "claim_vi", source),
                 "en": _text(record, "claim_en", source),
                 "evidence": pairs,
+                **({"id": record["id"]} if "id" in record else {}),
             }
         )
     return result
@@ -222,11 +238,23 @@ def pair_fingerprints(records: Iterable[dict]) -> set[str]:
     return fingerprints
 
 
-def require_disjoint(train_records: Iterable[dict], validation_records: Iterable[dict]) -> None:
-    overlap = pair_fingerprints(train_records) & pair_fingerprints(validation_records)
+def require_disjoint(
+    train_records: Iterable[dict], validation_records: Iterable[dict]
+) -> None:
+    def keys(records):
+        result = set()
+        for record in records:
+            if "id" in record:
+                result.add(("id", str(record["id"])))
+            for pair in (record, *record.get("evidence", [])):
+                for language in ("vi", "en"):
+                    result.add((language, _normalized(pair[language])))
+        return result
+
+    overlap = keys(train_records) & keys(validation_records)
     if overlap:
         raise ValueError(
-            f"Training and validation contain {len(overlap)} identical bilingual pair(s)."
+            f"Training and validation share {len(overlap)} identifier(s) or normalized text(s)."
         )
 
 
@@ -275,3 +303,15 @@ def save_payload(payload: dict, output: str | Path) -> None:
     temporary = output.with_suffix(output.suffix + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(output)
+
+
+def make_plateau_scheduler(optimizer):
+    """Support losses and negated maximization metrics without treating ties as gains."""
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=2,
+        threshold_mode="abs",
+        threshold=0.0,
+    )

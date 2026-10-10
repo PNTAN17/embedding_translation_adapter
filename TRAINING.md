@@ -1,73 +1,161 @@
-# Training
+# Training and evaluation
 
-The two entry points train only the embedding adapter. The multilingual BERT
-source module and the English target module remain frozen. MOCHEG also keeps
-the released stance head frozen.
+The entry points optimize only the adapter. The source embeddings, English
+backbone, and MOCHEG stance module remain frozen. Validation labels are used
+only for model selection. Neither trainer accepts a test file.
 
-The scripts consume prepared JSONL files. They do not create dataset splits or
-download task data. Prepare training and held-out validation files separately
-and keep the latter out of all optimization data. Before training starts, each
-script compares normalized bilingual pairs and stops if the two inputs share a
-pair.
+## Prepare existing partitions
 
-## ViVQA adapter
-
-Each line in both ViVQA files contains one Vietnamese and English question.
+Provide separate training, validation, and test JSONL files with original
+record IDs. A parallel record has this schema.
 
 ```json
-{"vi": "Có bao nhiêu người trong ảnh?", "en": "How many people are in the image?"}
+{"id": "original-question-id", "vi": "Câu hỏi", "en": "A question"}
 ```
 
-Run the trainer with:
+Use the same schema for PhoMT pairs. MOCHEG uses parallel claims and evidence.
+
+```json
+{"id": "original-claim-id", "claim_vi": "Tuyên bố", "claim_en": "A claim", "evidence_vi": ["Bằng chứng"], "evidence_en": ["Evidence"]}
+```
+
+```bash
+python prepare_data.py \
+  --task parallel \
+  --train /path/to/train.jsonl \
+  --validation /path/to/validation.jsonl \
+  --test /path/to/test.jsonl \
+  --output-dir data/clean
+```
+
+Use `--task mocheg` for the second schema. JSONL and canonical column CSV are
+accepted for parallel text. Use JSONL for MOCHEG evidence lists. The tool checks
+that original IDs are unique and disjoint across the three inputs. It preserves
+validation and test membership. It removes training records that repeat a
+Vietnamese or English text from either held out partition, then removes
+exact bilingual training duplicates. Distinct translations of one source are
+preserved. MOCHEG training duplicates must match both the claim pair and the
+complete evidence pair list, so shared training evidence alone does not remove
+a claim. The conservative held out text check also includes evidence.
+Repeated evidence can therefore exclude an otherwise distinct claim. Inspect
+the recorded removal reasons before using the result.
+
+`split_manifest.json` records input and output SHA256 hashes, all original IDs,
+retained training IDs, and removal reasons. These are identifiers for the
+supplied files. They are not a reconstruction of the paper splits or its fixed
+validation subset. Supply that existing subset from the experiment machine.
+The standalone trainers also check training versus validation overlap in each
+language independently. They cannot check an unseen test file.
+
+## ViVQA
+
+For downstream validation, supply JSONL records with the same IDs and Vietnamese
+questions as the validation pairs. The records may be a fixed subset of those
+pairs. They must contain English references and image paths.
+
+```json
+{"id": "original-question-id", "question_vi": "Câu hỏi", "answer_en": "two", "image": "image.jpg"}
+```
 
 ```bash
 python train_vivqa.py \
-  --train-pairs /path/to/vivqa_train_pairs.jsonl \
-  --validation-pairs /path/to/vivqa_validation_pairs.jsonl \
-  --output outputs/vivqa_adapter.pt
+  --config configs/vivqa_reference.json \
+  --train-pairs data/clean/train.jsonl \
+  --validation-pairs data/clean/validation.jsonl \
+  --validation-task-data /path/to/fixed_validation_subset.jsonl \
+  --validation-image-root /path/to/images \
+  --seed 42 \
+  --output outputs/vivqa_seed42.pt
 ```
 
-The defaults match the architecture and optimization settings reported in the
-paper. They use a hidden size of 1280, four encoder layers, two decoder layers,
-16 attention heads, a maximum length of 32, AdamW, and a OneCycle schedule with
-a peak learning rate of `1e-4`.
+Run separately with seeds 43 and 44 and distinct output names for repeated
+runs. The configuration selects the earliest checkpoint with the highest
+validation Exact Match. It uses patience ten and a maximum of thirty epochs.
+It does not generate the paper's fixed subset or run new trials automatically.
+Explicit command line values override JSON settings. Unknown settings fail.
 
-## MOCHEG adapter
+ViVQA alignment targets the full BLIP embedding module. Inference therefore
+uses `encoder_embeds` to avoid applying the embedding module twice. It uses the
+source attention mask and greedy answer decoding. The former norm heuristic
+could unmask padding because output LayerNorm gives padding vectors substantial
+norms. These corrections apply to this reference implementation and do not
+reconstruct historical predictions.
 
-Each MOCHEG line contains a translated claim and parallel evidence lists. Only
-the first five evidence pairs are used by default.
+## MOCHEG
+
+Task validation records contain the claim ID, Vietnamese claim and evidence,
+one of the three labels, and an optional list of image paths.
 
 ```json
-{"claim_vi": "Một tuyên bố tiếng Việt", "claim_en": "An English claim", "evidence_vi": ["Bằng chứng"], "evidence_en": ["Evidence"]}
+{"id": "original-claim-id", "claim_vi": "Tuyên bố", "evidence_vi": ["Bằng chứng"], "images": [], "label": "supported"}
 ```
-
-PhoMT is optional. Its JSONL format is the same two-field format used by the
-ViVQA trainer.
 
 ```bash
 python train_mocheg.py \
-  --train-pairs /path/to/mocheg_train_pairs.jsonl \
-  --validation-pairs /path/to/mocheg_validation_pairs.jsonl \
-  --phomt-train /path/to/phomt_train_pairs.jsonl \
-  --output outputs/mocheg_adapter.pt
+  --config configs/mocheg_reference.json \
+  --train-pairs /path/to/mocheg_train.jsonl \
+  --validation-pairs /path/to/mocheg_development.jsonl \
+  --validation-task-data /path/to/mocheg_development_task.jsonl \
+  --validation-image-root /path/to/images \
+  --phomt-train /path/to/phomt_train.jsonl \
+  --stance-checkpoint /path/to/compatible_mocheg_checkpoint.pt \
+  --output outputs/mocheg_seed42.pt
 ```
 
-The MOCHEG defaults use the same adapter architecture with a 512-dimensional
-output, a maximum length of 77, AdamW with learning rate `1e-5`, and a plateau
-scheduler. Claim and evidence alignment have equal weight. The stance state is
-copied from `checkpoints/mocheg_adapter.pt` so the new checkpoint can be loaded
-by `infer_mocheg.py`. It is never added to the optimizer.
+PhoMT is optional. The stance checkpoint must contain an existing compatible
+stance state. The script does not train or recreate that state. The example
+configuration selects the earliest checkpoint maximizing development micro F1
+plus macro F1. The plateau scheduler uses the same selection signal.
+The chosen `max_evidence` limit is used for alignment, task validation, and
+inference from the saved checkpoint. Validation evidence must match the paired
+evidence subset for the same claim ID.
 
-## Model selection
+## Alignment only reference training
 
-Both scripts select checkpoints only by held-out validation alignment loss.
-Their command line interfaces have no evaluation-data argument. The saved
-metadata records the selected epoch, seed, validation loss, model identifiers,
-sample counts, and loss history. It does not store local data paths.
+If task validation records are unavailable, omit `--config` and
+`--validation-task-data`, or explicitly set `--selection-metric alignment_loss`.
+Both trainers then select the smallest validation alignment loss. This option
+provides a usable text alignment trainer but differs from the downstream
+selection described in the paper. Use `--no-amp` for full precision and
+`--local-files-only` for cached upstream models.
 
-The released checkpoints under `checkpoints/` are the retained paper runs.
-New training runs are compatible with the inference commands, but their exact
-scores can vary with the prepared parallel data, software stack, and hardware.
+Every new checkpoint records the resolved scalar configuration, seed, input
+hashes and IDs when provided, selected epoch, metric, package versions, code
+hashes, and history through the selected epoch. The adjacent `.run.json` also
+records every completed epoch, including epochs after the selected checkpoint.
+The enclosing Git commit is informative only because files may have changed
+locally. The per file hashes identify the code actually used. Paths to input
+files are represented by basenames and hashes rather than machine specific
+absolute paths. Exact upstream model revisions are not pinned by the examples.
 
-Use `--no-amp` when full precision is required. Use `--local-files-only` after
-the three upstream models have been cached locally.
+## Evaluate saved predictions
+
+ViVQA predictions use `id` and `prediction`. MOCHEG predictions use `id` and
+`label`. The reference schemas are the task validation schemas above. Every
+reference must have exactly one prediction with the same ID. Missing, extra,
+and duplicate IDs cause an error.
+
+```bash
+python evaluate.py \
+  --task vivqa \
+  --references /path/to/test_references.jsonl \
+  --predictions /path/to/test_predictions.jsonl \
+  --output outputs/vivqa_metrics.json
+```
+
+To generate predictions, replace `--predictions` with the following options.
+
+```text
+--checkpoint /path/to/adapter.pt
+--predictions-output predictions/test.jsonl
+--image-root /path/to/images
+```
+
+ViVQA reports Exact Match and sample averaged token multiset F1 as percentages.
+Normalization lowercases text, removes English articles and punctuation,
+lemmatizes with NLTK POS tagging, then maps exact digit tokens from zero through
+twenty to words. Install the resources documented in the README. MOCHEG reports
+micro F1 and macro F1 over the fixed three label set. A class with no true or
+predicted examples contributes zero to macro F1. Every report includes input
+and prediction hashes. These scripts make new evaluations inspectable; they
+do not supply missing predictions or establish the paper's reported scores.

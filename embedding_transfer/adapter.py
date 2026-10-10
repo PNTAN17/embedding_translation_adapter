@@ -150,13 +150,19 @@ class EmbeddingTransferAdapter(nn.Module):
 
         self.pos_bias = nn.Parameter(torch.zeros(1, max_seq_length, hidden_dim))
         self.encoder_layers = nn.ModuleList(
-            [EncoderLayer(hidden_dim, num_heads, dropout) for _ in range(num_encoder_layers)]
+            [
+                EncoderLayer(hidden_dim, num_heads, dropout)
+                for _ in range(num_encoder_layers)
+            ]
         )
         self.encoder_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
         self.token_alignment = TokenAlignment(hidden_dim, num_heads // 2, dropout)
         self.glu = GatedLinearUnit(hidden_dim)
         self.decoder_layers = nn.ModuleList(
-            [DecoderLayer(hidden_dim, num_heads, dropout) for _ in range(num_decoder_layers)]
+            [
+                DecoderLayer(hidden_dim, num_heads, dropout)
+                for _ in range(num_decoder_layers)
+            ]
         )
         self.decoder_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
         self.translation_head = nn.Sequential(

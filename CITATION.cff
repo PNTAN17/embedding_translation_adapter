@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated paper."
+title: "Vietnamese Embedding-Space Transfer"
+type: software
+authors:
+  - family-names: Pham
+    given-names: Ngoc Thien An
+  - family-names: Nguyen
+    given-names: Huy Tien
+  - family-names: Le
+    given-names: Tung
+repository-code: "https://github.com/PNTAN17/transfer_embedding"
+preferred-citation:
+  type: article
+  title: "Teaching Frozen English Vision-Language Models to Read Vietnamese via Embedding-Space Translation Distillation"
+  authors:
+    - family-names: Pham
+      given-names: Ngoc Thien An
+    - family-names: Nguyen
+      given-names: Huy Tien
+    - family-names: Le
+      given-names: Tung
+  year: 2026

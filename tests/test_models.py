@@ -4,9 +4,28 @@ import torch
 
 from embedding_transfer.adapter import EmbeddingTransferAdapter
 from embedding_transfer.stance import TextImageStance
+from embedding_transfer.mocheg import MOCHEGPredictor
 
 
 class ModelShapeTests(unittest.TestCase):
+    def test_mocheg_inference_respects_checkpoint_evidence_limit(self):
+        predictor = MOCHEGPredictor.__new__(MOCHEGPredictor)
+        predictor.device = torch.device("cpu")
+        predictor.max_evidence = 1
+        encoded_counts = []
+
+        def encode(texts):
+            encoded_counts.append(len(texts))
+            return torch.ones(len(texts), 2, 512), torch.ones(
+                len(texts), 2, dtype=torch.long
+            )
+
+        predictor._encode_text = encode
+        predictor.stance = lambda *args: torch.zeros(1, 3)
+        result = predictor.predict("claim", ["first", "second"])
+        self.assertEqual(result["text_evidence_used"], 1)
+        self.assertEqual(encoded_counts, [1, 1])
+
     def test_adapter_shape(self):
         model = EmbeddingTransferAdapter(
             input_embedding_dim=8,

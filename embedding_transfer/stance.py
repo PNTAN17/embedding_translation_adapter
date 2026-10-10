@@ -1,4 +1,4 @@
-"""Frozen MOCHEG stance head used by the released checkpoint."""
+"""Frozen MOCHEG stance head expected by compatible checkpoints."""
 
 from __future__ import annotations
 
@@ -31,11 +31,15 @@ class TextImageStance(nn.Module):
     ) -> torch.Tensor:
         batch, claim_length, hidden = claim.shape
         slots, evidence_length = evidence.size(1), evidence.size(2)
-        repeated_claim = claim[:, None].expand(-1, slots, -1, -1).reshape(
-            batch * slots, claim_length, hidden
+        repeated_claim = (
+            claim[:, None]
+            .expand(-1, slots, -1, -1)
+            .reshape(batch * slots, claim_length, hidden)
         )
-        repeated_mask = claim_mask[:, None].expand(-1, slots, -1).reshape(
-            batch * slots, claim_length
+        repeated_mask = (
+            claim_mask[:, None]
+            .expand(-1, slots, -1)
+            .reshape(batch * slots, claim_length)
         )
         flat_evidence = evidence.reshape(batch * slots, evidence_length, hidden)
         key_padding_mask = evidence_mask.reshape(batch * slots, evidence_length) == 0
@@ -69,11 +73,15 @@ class TextImageStance(nn.Module):
     ) -> torch.Tensor:
         batch, claim_length, hidden = claim.shape
         slots, patch_count, image_dim = images.shape[1:]
-        repeated_claim = claim[:, None].expand(-1, slots, -1, -1).reshape(
-            batch * slots, claim_length, hidden
+        repeated_claim = (
+            claim[:, None]
+            .expand(-1, slots, -1, -1)
+            .reshape(batch * slots, claim_length, hidden)
         )
-        repeated_mask = claim_mask[:, None].expand(-1, slots, -1).reshape(
-            batch * slots, claim_length
+        repeated_mask = (
+            claim_mask[:, None]
+            .expand(-1, slots, -1)
+            .reshape(batch * slots, claim_length)
         )
         flat_images = images.reshape(batch * slots, patch_count, image_dim)
         matched, _ = self.img_attn(repeated_claim, flat_images, flat_images)

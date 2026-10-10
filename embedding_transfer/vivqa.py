@@ -15,7 +15,7 @@ from transformers import (
     BlipProcessor,
 )
 
-from .checkpoints import default_checkpoint, load_adapter, load_payload
+from .checkpoints import load_adapter, load_payload
 
 
 class ViVQAPredictor:
@@ -36,9 +36,13 @@ class ViVQAPredictor:
             local_files_only=local_files_only,
             use_fast=False,
         )
-        self.model = BlipForQuestionAnswering.from_pretrained(
-            "Salesforce/blip-vqa-base", local_files_only=local_files_only
-        ).to(self.device).eval()
+        self.model = (
+            BlipForQuestionAnswering.from_pretrained(
+                "Salesforce/blip-vqa-base", local_files_only=local_files_only
+            )
+            .to(self.device)
+            .eval()
+        )
         mbert = BertModel.from_pretrained(
             "bert-base-multilingual-cased", local_files_only=local_files_only
         )
@@ -50,6 +54,21 @@ class ViVQAPredictor:
             for parameter in module.parameters():
                 parameter.requires_grad_(False)
         del mbert
+
+    @classmethod
+    def from_modules(
+        cls, adapter, model, source_embeddings, tokenizer, processor, device
+    ):
+        """Reuse frozen modules during validation without reloading checkpoints."""
+        instance = cls.__new__(cls)
+        instance.adapter = adapter
+        instance.model = model
+        instance.source_embeddings = source_embeddings
+        instance.tokenizer = tokenizer
+        instance.processor = processor
+        instance.device = device
+        instance.max_length = adapter.max_seq_length
+        return instance
 
     @torch.inference_mode()
     def predict(self, image_path: str | Path, question: str) -> str:
@@ -77,12 +96,14 @@ class ViVQAPredictor:
         source_embeddings = self.source_embeddings(source.input_ids).float()
         adapted = self.adapter(source_embeddings, source.attention_mask)
 
-        norms = adapted.norm(dim=-1)
-        threshold = norms[source.attention_mask.bool()].mean() * 0.1
-        attention_mask = (norms > threshold).long() | source.attention_mask
+        # The adapter targets the complete BLIP embedding module. Bypass that
+        # module here to avoid applying position embeddings and LayerNorm twice.
+        # Output LayerNorm gives padding large norms too, so do not infer a mask
+        # from vector magnitude.
+        attention_mask = source.attention_mask
         question_output = self.model.text_encoder(
             input_ids=None,
-            inputs_embeds=adapted,
+            encoder_embeds=adapted,
             attention_mask=attention_mask,
             encoder_hidden_states=image_embeddings,
             encoder_attention_mask=image_mask,
@@ -99,6 +120,7 @@ class ViVQAPredictor:
             max_length=15,
             min_length=2,
             num_beams=1,
+            do_sample=False,
             eos_token_id=self.processor.tokenizer.sep_token_id,
             pad_token_id=self.processor.tokenizer.pad_token_id,
             encoder_hidden_states=question_output.last_hidden_state,
@@ -122,7 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=default_checkpoint("vivqa_adapter.pt"),
+        required=True,
+        help="Compatible ViVQA checkpoint supplied by the user.",
     )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--local-files-only", action="store_true")

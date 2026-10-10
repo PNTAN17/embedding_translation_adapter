@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 from transformers import BertModel, BertTokenizer, CLIPImageProcessor, CLIPVisionModel
 
-from .checkpoints import default_checkpoint, load_adapter, load_payload
+from .checkpoints import load_adapter, load_payload
 from .stance import TextImageStance
 from .vivqa import choose_device
 
@@ -29,6 +29,9 @@ class MOCHEGPredictor:
         self.local_files_only = local_files_only
         payload = load_payload(checkpoint, "mocheg")
         self.max_length = payload["adapter_config"]["max_seq_length"]
+        self.max_evidence = payload.get("metadata", {}).get("max_evidence", 5)
+        if not isinstance(self.max_evidence, int) or not 1 <= self.max_evidence <= 5:
+            raise ValueError("Checkpoint max_evidence must lie between one and five")
         self.adapter = load_adapter(payload, self.device)
         self.stance = TextImageStance().to(self.device).eval()
         self.stance.load_state_dict(payload["stance_state_dict"], strict=True)
@@ -51,6 +54,32 @@ class MOCHEGPredictor:
         self.vision_model = None
         self.image_processor = None
 
+    @classmethod
+    def from_modules(
+        cls,
+        adapter,
+        stance_state,
+        source_embeddings,
+        tokenizer,
+        device,
+        local_files_only=False,
+        max_evidence=5,
+    ):
+        instance = cls.__new__(cls)
+        instance.device = device
+        instance.local_files_only = local_files_only
+        instance.max_length = adapter.max_seq_length
+        instance.max_evidence = max_evidence
+        instance.adapter = adapter
+        instance.stance = TextImageStance().to(device).eval()
+        instance.stance.load_state_dict(stance_state, strict=True)
+        for parameter in instance.stance.parameters():
+            parameter.requires_grad_(False)
+        instance.source_word_embeddings = source_embeddings
+        instance.tokenizer = tokenizer
+        instance.vision_model = instance.image_processor = None
+        return instance
+
     def _encode_text(self, texts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = self.tokenizer(
             texts,
@@ -70,10 +99,14 @@ class MOCHEGPredictor:
             "openai/clip-vit-base-patch32",
             local_files_only=self.local_files_only,
         )
-        self.vision_model = CLIPVisionModel.from_pretrained(
-            "openai/clip-vit-base-patch32",
-            local_files_only=self.local_files_only,
-        ).to(self.device).eval()
+        self.vision_model = (
+            CLIPVisionModel.from_pretrained(
+                "openai/clip-vit-base-patch32",
+                local_files_only=self.local_files_only,
+            )
+            .to(self.device)
+            .eval()
+        )
         for parameter in self.vision_model.parameters():
             parameter.requires_grad_(False)
 
@@ -97,7 +130,7 @@ class MOCHEGPredictor:
     ) -> dict:
         if not claim.strip():
             raise ValueError("Claim must not be empty.")
-        evidence = [item for item in evidence if item.strip()][:5]
+        evidence = [item for item in evidence if item.strip()][: self.max_evidence]
         if not evidence:
             raise ValueError("At least one nonempty textual evidence item is required.")
         images = list(images or [])[:5]
@@ -150,7 +183,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=default_checkpoint("mocheg_adapter.pt"),
+        required=True,
+        help="Compatible MOCHEG checkpoint supplied by the user.",
     )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--local-files-only", action="store_true")

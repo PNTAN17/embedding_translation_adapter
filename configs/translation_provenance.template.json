@@ -1,0 +1,17 @@
+{
+  "status": "template_not_a_record_of_the_paper_run",
+  "provider": null,
+  "model_id": null,
+  "model_revision_or_access_date": null,
+  "system_prompt": null,
+  "user_prompt_template": null,
+  "temperature": null,
+  "top_p": null,
+  "top_k": null,
+  "maximum_output_tokens": null,
+  "seed_if_supported": null,
+  "retry_and_failure_policy": null,
+  "translation_cache_sha256": null,
+  "input_split_manifest_sha256": null,
+  "terms_and_redistribution_review": null
+}

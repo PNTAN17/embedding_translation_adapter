@@ -8,9 +8,22 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from transformers import BertModel, BertTokenizer, BlipForQuestionAnswering, BlipProcessor
+from transformers import (
+    BertModel,
+    BertTokenizer,
+    BlipForQuestionAnswering,
+    BlipProcessor,
+)
 
 from embedding_transfer.adapter import EmbeddingTransferAdapter
+from embedding_transfer.provenance import (
+    parse_config,
+    run_provenance,
+    save_history,
+    validate_training_args,
+)
+from embedding_transfer.data import indexed_records, read_records
+from embedding_transfer.metrics import predict_records, score_records
 from embedding_transfer.training import (
     AlignmentLoss,
     choose_device,
@@ -49,10 +62,15 @@ def batch_loss(
     device: torch.device,
     amp: bool,
 ) -> torch.Tensor:
-    source = tokenize(source_tokenizer, [item["vi"] for item in records], length, device)
-    target = tokenize(target_tokenizer, [item["en"] for item in records], length, device)
-    with torch.no_grad(), torch.autocast(
-        device_type=device.type, dtype=torch.float16, enabled=amp
+    source = tokenize(
+        source_tokenizer, [item["vi"] for item in records], length, device
+    )
+    target = tokenize(
+        target_tokenizer, [item["en"] for item in records], length, device
+    )
+    with (
+        torch.no_grad(),
+        torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp),
     ):
         source_values = source_embeddings(input_ids=source.input_ids)
         target_values = target_embeddings(input_ids=target.input_ids)
@@ -88,6 +106,10 @@ def train_epoch(
         group_offset = batch_index % args.gradient_accumulation
         if group_offset == 0:
             group_size = min(args.gradient_accumulation, len(loader) - batch_index)
+            group_examples = min(
+                group_size * args.batch_size,
+                len(loader.dataset) - batch_index * args.batch_size,
+            )
         loss = batch_loss(
             records,
             adapter,
@@ -100,7 +122,7 @@ def train_epoch(
             device,
             args.amp and device.type == "cuda",
         )
-        scaler.scale(loss / group_size).backward()
+        scaler.scale(loss * len(records) / group_examples).backward()
         total += loss.detach().item() * len(records)
         samples += len(records)
         end_of_group = group_offset + 1 == group_size
@@ -148,7 +170,8 @@ def validate(
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    args = parse_config(build_parser())
+    validate_training_args(args)
     if args.gradient_accumulation < 1 or args.patience < 1:
         raise ValueError("gradient accumulation and patience must be positive")
     seed_everything(args.seed)
@@ -157,8 +180,34 @@ def main() -> None:
     train_records = load_parallel_jsonl(args.train_pairs)
     validation_records = load_parallel_jsonl(args.validation_pairs)
     require_disjoint(train_records, validation_records)
+    task_records = (
+        read_records(args.validation_task_data) if args.validation_task_data else None
+    )
+    if args.selection_metric == "exact_match" and task_records is None:
+        raise ValueError("exact_match selection requires --validation-task-data")
+    if task_records is not None:
+        known = indexed_records(validation_records)
+        if not indexed_records(task_records).keys() <= known.keys():
+            raise ValueError(
+                "Task validation IDs must be a subset of validation pair IDs"
+            )
+        for row in task_records:
+            if row["question_vi"].strip() != known[str(row["id"])]["vi"].strip():
+                raise ValueError(
+                    "Task validation questions must match their bilingual IDs"
+                )
+    provenance = run_provenance(
+        args,
+        {
+            "train_pairs": args.train_pairs,
+            "validation_pairs": args.validation_pairs,
+            "validation_task_data": args.validation_task_data,
+        },
+    )
     train_loader = make_loader(train_records, args.batch_size, True, args.seed)
-    validation_loader = make_loader(validation_records, args.batch_size, False, args.seed)
+    validation_loader = make_loader(
+        validation_records, args.batch_size, False, args.seed
+    )
 
     source_tokenizer = BertTokenizer.from_pretrained(
         SOURCE_MODEL, local_files_only=args.local_files_only
@@ -175,7 +224,7 @@ def main() -> None:
     )
     source_embeddings = freeze(source_model.embeddings.to(device))
     target_embeddings = freeze(target_model.text_encoder.embeddings.to(device))
-    del source_model, target_model, target_processor
+    del source_model
 
     config = {
         "input_embedding_dim": 768,
@@ -188,6 +237,20 @@ def main() -> None:
         "max_seq_length": args.max_length,
     }
     adapter = EmbeddingTransferAdapter(**config).to(device)
+    predictor = None
+    if task_records is not None:
+        from embedding_transfer.vivqa import ViVQAPredictor
+
+        predictor = ViVQAPredictor.from_modules(
+            adapter,
+            freeze(target_model.to(device)),
+            source_embeddings,
+            source_tokenizer,
+            target_processor,
+            device,
+        )
+    else:
+        del target_model, target_processor
     criterion = AlignmentLoss().to(device)
     optimizer = torch.optim.AdamW(
         adapter.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -205,6 +268,7 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
     best = float("inf")
+    selected_epoch = None
     stale_epochs = 0
     history = []
     for epoch in range(1, args.epochs + 1):
@@ -233,19 +297,39 @@ def main() -> None:
             args,
             device,
         )
+        if not math.isfinite(train_value) or not math.isfinite(validation_value):
+            raise RuntimeError("Nonfinite alignment loss; no checkpoint was selected")
+        task_metrics = (
+            score_records(
+                task_records,
+                predict_records(
+                    task_records, predictor, "vivqa", args.validation_image_root
+                ),
+                "vivqa",
+            )
+            if predictor
+            else {}
+        )
+        selection_value = (
+            -task_metrics["exact_match"]
+            if args.selection_metric == "exact_match"
+            else validation_value
+        )
         history.append(
             {
                 "epoch": epoch,
                 "train_alignment_loss": train_value,
                 "validation_alignment_loss": validation_value,
+                "validation_task_metrics": task_metrics,
             }
         )
         print(
             f"epoch={epoch} train_alignment_loss={train_value:.6f} "
             f"validation_alignment_loss={validation_value:.6f}"
         )
-        if validation_value < best:
-            best = validation_value
+        if selection_value < best:
+            best = selection_value
+            selected_epoch = epoch
             stale_epochs = 0
             save_payload(
                 {
@@ -257,8 +341,10 @@ def main() -> None:
                         "seed": args.seed,
                         "selected_epoch": epoch,
                         "selection_split": "validation",
-                        "selection_metric": "alignment_loss",
+                        "selection_metric": args.selection_metric,
                         "validation_alignment_loss": validation_value,
+                        "validation_task_metrics": task_metrics,
+                        "provenance": provenance,
                         "source_model": SOURCE_MODEL,
                         "target_model": TARGET_MODEL,
                         "train_pairs": len(train_records),
@@ -270,16 +356,27 @@ def main() -> None:
             )
         else:
             stale_epochs += 1
+        save_history(args.output, provenance, history, selected_epoch)
+        if stale_epochs:
             if stale_epochs >= args.patience:
                 print(f"stopped after {args.patience} epochs without improvement")
                 break
-    print(f"saved={Path(args.output).expanduser().resolve()} best_validation_loss={best:.6f}")
+    print(
+        f"saved={Path(args.output).expanduser().resolve()} selected_epoch={selected_epoch} metric={args.selection_metric}"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-pairs", type=Path, required=True)
     parser.add_argument("--validation-pairs", type=Path, required=True)
+    parser.add_argument("--validation-task-data", type=Path)
+    parser.add_argument("--validation-image-root", type=Path, default=Path("."))
+    parser.add_argument(
+        "--selection-metric",
+        choices=("alignment_loss", "exact_match"),
+        default="alignment_loss",
+    )
     parser.add_argument("--output", type=Path, default=Path("outputs/vivqa_adapter.pt"))
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=10)
