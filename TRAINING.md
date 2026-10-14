@@ -4,6 +4,10 @@ The entry points optimize only the adapter. The source embeddings, English
 backbone, and MOCHEG stance module remain frozen. Validation labels are used
 only for model selection. Neither trainer accepts a test file.
 
+By default, ViVQA selects checkpoints by validation Exact Match (EM), and
+MOCHEG uses development F1 (micro F1 + macro F1). Supply
+`--validation-task-data` for these modes.
+
 Run the commands below from the repository root. Relative paths in JSON
 configurations are resolved from the current working directory. Explicit
 command line options override JSON settings.
@@ -175,9 +179,8 @@ strict and expects nonempty evidence pairs in its input files.
 
 ## Alignment only reference training
 
-If task validation records are unavailable, omit `--config` and
-`--validation-task-data`. Both trainers default to
-`--selection-metric alignment_loss` for this setup. Use `--no-amp` for full
+For alignment-only training, omit `--config` and `--validation-task-data`,
+and explicitly pass `--selection-metric alignment_loss`. Use `--no-amp` for full
 precision and `--local-files-only` for cached upstream models.
 
 The `.pt` output stores adapter weights, configuration, seed, input hashes,

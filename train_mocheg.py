@@ -462,7 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--selection-metric",
         choices=("alignment_loss", "micro_macro_f1_sum"),
-        default="alignment_loss",
+        default="micro_macro_f1_sum",
     )
     parser.add_argument("--phomt-train", type=Path)
     parser.add_argument(

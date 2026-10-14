@@ -62,12 +62,12 @@ class SupplementaryTests(unittest.TestCase):
             checkpoint = Path(directory) / "checkpoint.pt"
             checkpoint.write_bytes(b"independently selected checkpoint")
             record = {
-                "test": {"samples": 2000, "exact_accuracy": 0.4365},
+                "test": {"samples": 4, "exact_accuracy": 0.25},
                 "predictions_sha256": artifact(predictions)["sha256"],
                 "checkpoint_sha256": artifact(checkpoint)["sha256"],
             }
             verify_record(record, predictions, checkpoint)
-            verify_scores(record, np.asarray([1.0] * 873 + [0.0] * 1127))
+            verify_scores(record, np.asarray([1.0, 0.0, 0.0, 0.0]))
 
     def test_nonfinite_metrics_and_invalid_sample_counts_are_rejected(self):
         for accuracy in (float("nan"), float("inf"), -0.1, 1.1, "0.5", True):
@@ -101,7 +101,7 @@ class SupplementaryTests(unittest.TestCase):
             checkpoint = Path(directory) / "checkpoint.pt"
             checkpoint.write_bytes(b"original checkpoint")
             record = {
-                "test": {"samples": 3001, "exact_accuracy": 0.4585},
+                "test": {"samples": 2, "exact_accuracy": 0.5},
                 "predictions_sha256": artifact(predictions)["sha256"],
                 "checkpoint_sha256": artifact(checkpoint)["sha256"],
             }

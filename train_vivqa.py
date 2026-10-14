@@ -496,7 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--selection-metric",
         choices=("alignment_loss", "exact_match"),
-        default="alignment_loss",
+        default="exact_match",
     )
     parser.add_argument("--output", type=Path, default=Path("outputs/vivqa_adapter.pt"))
     parser.add_argument(

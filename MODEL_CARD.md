@@ -43,6 +43,12 @@ For ViVQA Stage 2 training, set `init_checkpoint` in
 `configs/vivqa_stage2.json` or pass `--init-checkpoint /path/to/stage1.pt`.
 Use a Stage 1 checkpoint trained with the same seed and input data.
 
+## Checkpoint selection
+
+ViVQA checkpoints are selected by validation Exact Match (EM). MOCHEG
+checkpoints are selected by development F1, using the sum of micro F1 and
+macro F1 (`micro_macro_f1_sum`).
+
 ## Dependencies
 
 The repository does not bundle upstream backbone weights. Inference loads the
