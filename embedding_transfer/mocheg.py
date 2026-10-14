@@ -184,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint",
         type=Path,
         required=True,
-        help="Compatible MOCHEG checkpoint supplied by the user.",
+        help="MOCHEG checkpoint path.",
     )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--local-files-only", action="store_true")

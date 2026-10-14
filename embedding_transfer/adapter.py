@@ -1,4 +1,4 @@
-"""Source-conditioned dual-branch embedding adapter used by both tasks."""
+"""Embedding adapter components."""
 
 from __future__ import annotations
 
@@ -116,11 +116,7 @@ class GatedLinearUnit(nn.Module):
 
 
 class EmbeddingTransferAdapter(nn.Module):
-    """Map mBERT token embeddings into a frozen target model's text space.
-
-    Attribute names intentionally match the training implementation so that
-    the released state dictionaries can be loaded with ``strict=True``.
-    """
+    """Map embeddings into a target space."""
 
     def __init__(
         self,

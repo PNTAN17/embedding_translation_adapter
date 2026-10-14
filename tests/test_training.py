@@ -100,6 +100,25 @@ class TrainingUtilityTests(unittest.TestCase):
             records = load_mocheg_jsonl(path)
             self.assertEqual(records[0]["evidence"][0]["en"], "evidence")
 
+    def test_mocheg_evidence_limit_applies_after_empty_pair_filtering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pairs.jsonl"
+            record = {
+                "claim_vi": "tuyên bố",
+                "claim_en": "claim",
+                "evidence_vi": [" ", "bằng chứng một", "bằng chứng hai"],
+                "evidence_en": ["", "first evidence", "second evidence"],
+            }
+            path.write_text(json.dumps(record) + "\n")
+            self.assertEqual(
+                load_mocheg_jsonl(path, 1)[0]["evidence"],
+                [{"vi": "bằng chứng một", "en": "first evidence"}],
+            )
+            record["evidence_en"][0] = "unpaired translation"
+            path.write_text(json.dumps(record) + "\n")
+            with self.assertRaises(ValueError):
+                load_mocheg_jsonl(path, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

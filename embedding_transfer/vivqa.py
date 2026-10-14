@@ -59,7 +59,7 @@ class ViVQAPredictor:
     def from_modules(
         cls, adapter, model, source_embeddings, tokenizer, processor, device
     ):
-        """Reuse frozen modules during validation without reloading checkpoints."""
+        """Create a predictor from loaded modules."""
         instance = cls.__new__(cls)
         instance.adapter = adapter
         instance.model = model
@@ -145,7 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint",
         type=Path,
         required=True,
-        help="Compatible ViVQA checkpoint supplied by the user.",
+        help="ViVQA checkpoint path.",
     )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--local-files-only", action="store_true")

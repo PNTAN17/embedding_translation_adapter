@@ -1,4 +1,4 @@
-"""Checkpoint loading shared by the two inference entry points."""
+"""Checkpoint loading utilities."""
 
 from __future__ import annotations
 

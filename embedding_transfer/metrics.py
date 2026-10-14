@@ -1,4 +1,4 @@
-"""Task metrics shared by saved-prediction scoring and validation."""
+"""Evaluation metrics and utilities."""
 
 from collections import Counter
 import re
@@ -74,6 +74,7 @@ def score_records(
         ]
         return {
             "count": count,
+            "exact_match_correct": sum(pred == ref for pred, ref in pairs),
             "unit": "percent",
             "normalization": NORMALIZATION,
             "exact_match": 100 * sum(pred == ref for pred, ref in pairs) / count,
@@ -94,6 +95,7 @@ def score_records(
         )
     return {
         "count": count,
+        "micro_f1_correct": sum(pred == ref for pred, ref in pairs),
         "unit": "percent",
         "micro_f1": 100 * sum(pred == ref for pred, ref in pairs) / count,
         "macro_f1": sum(per_class.values()) / len(LABELS),

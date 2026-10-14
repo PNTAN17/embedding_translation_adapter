@@ -1,8 +1,9 @@
-"""Resolved configuration and complete epoch records for new local runs."""
+"""Configuration and run metadata utilities."""
 
 import argparse
 from importlib.metadata import PackageNotFoundError, version
 import json
+import math
 from pathlib import Path
 import subprocess
 
@@ -13,7 +14,7 @@ def parse_config(parser: argparse.ArgumentParser, argv=None):
     parser.add_argument(
         "--config",
         type=Path,
-        help="JSON configuration; explicit command line options take precedence",
+        help="JSON configuration file; command line options override it.",
     )
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=Path)
@@ -37,7 +38,15 @@ def parse_config(parser: argparse.ArgumentParser, argv=None):
             ) and not isinstance(value, bool):
                 raise ValueError(f"Configuration field {name!r} must be boolean")
             if action.type:
+                if action.type is int and (
+                    isinstance(value, bool) or not isinstance(value, int)
+                ):
+                    raise ValueError(f"Configuration field {name!r} must be an integer")
+                if action.type is float and isinstance(value, bool):
+                    raise ValueError(f"Configuration field {name!r} must be numeric")
                 value = action.type(value)
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise ValueError(f"Configuration field {name!r} must be finite")
             if action.choices and value not in action.choices:
                 raise ValueError(f"Invalid configuration value for {name!r}")
             action.required = False
@@ -63,7 +72,15 @@ def run_provenance(args, files: dict) -> dict:
                     else None
                 )
     packages = {}
-    for package in ("torch", "transformers", "Pillow", "nltk"):
+    for package in (
+        "torch",
+        "transformers",
+        "Pillow",
+        "nltk",
+        "numpy",
+        "scipy",
+        "filelock",
+    ):
         try:
             packages[package] = version(package)
         except PackageNotFoundError:
@@ -81,7 +98,9 @@ def run_provenance(args, files: dict) -> dict:
     code = {
         str(path.relative_to(root)): file_record(path)["sha256"]
         for path in sorted(root.rglob("*.py"))
-        if "__pycache__" not in path.parts
+        if not {"__pycache__", ".venv", "venv", ".git"}.intersection(
+            path.relative_to(root).parts
+        )
     }
     return {
         "configuration": config,
@@ -107,6 +126,15 @@ def save_history(
 
 
 def validate_training_args(args) -> None:
+    for name in (
+        "dropout",
+        "learning_rate",
+        "weight_decay",
+        "claim_weight",
+        "evidence_weight",
+    ):
+        if hasattr(args, name) and not math.isfinite(getattr(args, name)):
+            raise ValueError(f"{name} must be finite")
     for name in (
         "epochs",
         "patience",

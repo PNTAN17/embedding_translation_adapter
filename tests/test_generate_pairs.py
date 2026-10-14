@@ -220,7 +220,9 @@ class PairGenerationTests(unittest.TestCase):
         class Responses:
             def create(self, **kwargs):
                 calls.append(kwargs)
-                return SimpleNamespace(output_text="one", model="resolved-openai")
+                return SimpleNamespace(
+                    output_text="one", model="resolved-openai", status="completed"
+                )
 
         class Client:
             def __init__(self, **kwargs):
@@ -234,9 +236,7 @@ class PairGenerationTests(unittest.TestCase):
         module.OpenAI = Client
         args = arguments(Path("."))
         with patch.dict(sys.modules, {"openai": module}):
-            translate, _version, close, versions = generate_pairs.build_translator(
-                args
-            )
+            translate, _version, close, versions = generate_pairs.build_translator(args)
             self.assertEqual(translate("một"), "one")
             self.assertEqual(versions(), ["resolved-openai"])
             close()
@@ -258,7 +258,11 @@ class PairGenerationTests(unittest.TestCase):
         class Models:
             def generate_content(self, **kwargs):
                 calls.append(kwargs)
-                return SimpleNamespace(text="one", model_version="resolved-gemini")
+                return SimpleNamespace(
+                    text="one",
+                    model_version="resolved-gemini",
+                    candidates=[SimpleNamespace(finish_reason="STOP")],
+                )
 
         class Client:
             def __init__(self, **kwargs):
@@ -286,9 +290,7 @@ class PairGenerationTests(unittest.TestCase):
         google.genai = genai
         args = arguments(Path("."), provider="gemini")
         with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
-            translate, _version, close, versions = generate_pairs.build_translator(
-                args
-            )
+            translate, _version, close, versions = generate_pairs.build_translator(args)
             self.assertEqual(translate("một"), "one")
             self.assertEqual(versions(), ["resolved-gemini"])
             close()
@@ -302,6 +304,70 @@ class PairGenerationTests(unittest.TestCase):
                 "max_output_tokens": 64,
             },
         )
+
+    def test_incomplete_provider_text_is_not_saved_as_a_translation(self):
+        responses = (
+            (
+                generate_pairs.completed_openai_translation,
+                SimpleNamespace(output_text="The car is", status="incomplete"),
+            ),
+            (
+                generate_pairs.completed_gemini_translation,
+                SimpleNamespace(
+                    text="The car is",
+                    candidates=[SimpleNamespace(finish_reason="MAX_TOKENS")],
+                ),
+            ),
+        )
+        for extract, response in responses:
+            with self.subTest(provider=extract.__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    args = arguments(Path(directory), max_attempts=1)
+                    write_jsonl(args.input, [{"id": "a", "vi": "Xe màu đỏ"}])
+                    self.assertEqual(
+                        generate_pairs.run(
+                            args, lambda _text: extract(response), "test"
+                        ),
+                        1,
+                    )
+                    self.assertEqual(
+                        generate_pairs.read_records(args.output)[0]["en"], ""
+                    )
+                    metadata = json.loads(
+                        generate_pairs.metadata_path(args.output).read_text()
+                    )
+                    self.assertEqual(metadata["rows_completed"], 0)
+                    self.assertEqual(metadata["failed_ids_in_last_run"], ["a"])
+
+    def test_missing_completion_status_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "complete"):
+            generate_pairs.completed_openai_translation(
+                SimpleNamespace(output_text="one")
+            )
+        with self.assertRaisesRegex(ValueError, "complete"):
+            generate_pairs.completed_gemini_translation(
+                SimpleNamespace(text="one", candidates=[])
+            )
+        self.assertEqual(
+            generate_pairs.completed_gemini_translation(
+                SimpleNamespace(
+                    text=" one ",
+                    candidates=[
+                        SimpleNamespace(finish_reason=SimpleNamespace(value="STOP"))
+                    ],
+                )
+            ),
+            "one",
+        )
+
+    def test_nonfinite_timeout_or_retry_delay_is_rejected(self):
+        for name in ("request_timeout", "retry_delay"):
+            for value in (float("nan"), float("inf")):
+                with self.subTest(option=name, value=value):
+                    with self.assertRaises(ValueError):
+                        generate_pairs.validate_args(
+                            arguments(Path("."), **{name: value})
+                        )
 
     def test_auth_failure_stops_before_later_batches(self):
         class AuthenticationError(RuntimeError):

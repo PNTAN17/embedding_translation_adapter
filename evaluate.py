@@ -1,4 +1,4 @@
-"""Score saved task predictions or generate predictions with a supplied checkpoint."""
+"""Evaluate model predictions."""
 
 import argparse
 from pathlib import Path

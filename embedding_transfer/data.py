@@ -1,4 +1,4 @@
-"""Dataset checks and provenance without heavyweight model dependencies."""
+"""Dataset preparation utilities."""
 
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ def write_jsonl(records: list[dict], path: str | Path) -> None:
 
 
 def text_keys(record: dict, task: str) -> set[tuple[str, str]]:
-    """Check either language independently, including MOCHEG evidence."""
+    """Build normalized text keys."""
     pairs = [(record.get("vi"), record.get("en"))]
     if task == "mocheg":
         vi = record.get("evidence_vi")

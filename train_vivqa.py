@@ -1,4 +1,4 @@
-"""Train the ViVQA embedding adapter from prepared bilingual JSONL files."""
+"""Train the ViVQA adapter."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from transformers import (
 )
 
 from embedding_transfer.adapter import EmbeddingTransferAdapter
+from embedding_transfer.checkpoints import load_payload
 from embedding_transfer.provenance import (
     parse_config,
     run_provenance,
@@ -38,6 +39,119 @@ from embedding_transfer.training import (
 
 SOURCE_MODEL = "bert-base-multilingual-cased"
 TARGET_MODEL = "Salesforce/blip-vqa-base"
+
+
+def validate_protocol(args, validation_records, task_records) -> None:
+    """Validate training inputs and settings."""
+    if args.gradient_accumulation < 1:
+        raise ValueError("gradient accumulation must be positive")
+    if args.training_stage == "stage1":
+        if args.init_checkpoint is not None:
+            raise ValueError("Stage 1 starts from random adapter weights")
+        if args.early_stopping:
+            raise ValueError("Stage 1 requires --no-early-stopping")
+    if args.training_stage == "stage2" and args.init_checkpoint is None:
+        raise ValueError("Stage 2 requires --init-checkpoint from Stage 1")
+    outputs = (args.output, args.output.with_suffix(".run.json"))
+    destinations = {
+        path.expanduser().resolve()
+        for output in outputs
+        for path in (output, output.with_suffix(output.suffix + ".tmp"))
+    }
+    for name in (
+        "train_pairs",
+        "validation_pairs",
+        "validation_task_data",
+        "init_checkpoint",
+        "config",
+    ):
+        path = getattr(args, name, None)
+        if path is not None and path.expanduser().resolve() in destinations:
+            raise ValueError(f"Checkpoint or history output would overwrite {name}")
+    if args.expected_validation_count is not None:
+        if args.expected_validation_count < 1:
+            raise ValueError("expected validation count must be positive")
+        if task_records is None or len(task_records) != args.expected_validation_count:
+            raise ValueError(
+                "Task validation count does not match --expected-validation-count"
+            )
+    if args.selection_metric == "exact_match" and task_records is None:
+        raise ValueError("exact_match selection requires --validation-task-data")
+    if args.validation_task_scope == "full" and task_records is None:
+        raise ValueError("Full task validation requires --validation-task-data")
+    if task_records is None:
+        return
+    known = indexed_records(validation_records)
+    actual = indexed_records(task_records)
+    if not actual.keys() <= known.keys():
+        raise ValueError("Task validation IDs must be a subset of validation pair IDs")
+    if args.validation_task_scope == "full" and actual.keys() != known.keys():
+        raise ValueError("Full task validation must cover every validation pair ID")
+    for identifier, row in actual.items():
+        for key in ("question_vi", "answer_en", "image"):
+            if not isinstance(row.get(key), str) or not row[key].strip():
+                raise ValueError(f"Task validation requires a nonempty {key!r}")
+        if row["question_vi"].strip() != known[identifier]["vi"].strip():
+            raise ValueError("Task validation questions must match their bilingual IDs")
+
+
+def initialize_adapter(adapter, config, args, provenance) -> dict | None:
+    """Initialize adapter weights from a checkpoint."""
+    if args.init_checkpoint is None:
+        return None
+    payload = load_payload(args.init_checkpoint, "vivqa")
+    if payload["adapter_config"] != config:
+        raise ValueError("Initialization checkpoint adapter configuration differs")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("Initialization checkpoint requires model metadata")
+    for key, expected in (
+        ("source_model", SOURCE_MODEL),
+        ("target_model", TARGET_MODEL),
+    ):
+        if metadata.get(key) != expected:
+            raise ValueError(f"Initialization checkpoint has an incompatible {key}")
+    if args.training_stage == "stage2":
+        if metadata.get("training_stage") != "stage1":
+            raise ValueError("Stage 2 must initialize from a Stage 1 checkpoint")
+        if metadata.get("seed") != args.seed:
+            raise ValueError("Stage 2 must use the same seed as Stage 1")
+        if (
+            metadata.get("selection_split") != "validation"
+            or metadata.get("selection_metric") != args.selection_metric
+            or not isinstance(metadata.get("selected_epoch"), int)
+            or metadata["selected_epoch"] < 1
+        ):
+            raise ValueError(
+                "Stage 1 must have a compatible validation-selected checkpoint"
+            )
+        previous_provenance = metadata.get("provenance")
+        if not isinstance(previous_provenance, dict) or not isinstance(
+            previous_provenance.get("inputs"), dict
+        ):
+            raise ValueError("Stage 1 requires input-artifact provenance")
+        previous_inputs = previous_provenance["inputs"]
+        for name in ("train_pairs", "validation_pairs", "validation_task_data"):
+            previous = previous_inputs.get(name, {}).get("sha256")
+            current = provenance["inputs"].get(name, {}).get("sha256")
+            if previous != current or (
+                name != "validation_task_data" and current is None
+            ):
+                raise ValueError(f"Stage 2 must retain the Stage 1 {name} data")
+    for name, value in payload["adapter_state_dict"].items():
+        if not isinstance(value, torch.Tensor) or not torch.isfinite(value).all():
+            raise ValueError(
+                f"Initialization contains invalid adapter weights at {name!r}"
+            )
+    adapter.load_state_dict(payload["adapter_state_dict"], strict=True)
+    return {
+        "mode": "adapter_weights_only",
+        "checkpoint": provenance["inputs"]["init_checkpoint"],
+        "source_stage": metadata.get("training_stage"),
+        "source_seed": metadata.get("seed"),
+        "source_selected_epoch": metadata.get("selected_epoch"),
+        "optimizer_and_scheduler": "new",
+    }
 
 
 def tokenize(tokenizer, texts: list[str], length: int, device: torch.device):
@@ -172,8 +286,6 @@ def validate(
 def main() -> None:
     args = parse_config(build_parser())
     validate_training_args(args)
-    if args.gradient_accumulation < 1 or args.patience < 1:
-        raise ValueError("gradient accumulation and patience must be positive")
     seed_everything(args.seed)
     device = choose_device(args.device)
 
@@ -183,31 +295,34 @@ def main() -> None:
     task_records = (
         read_records(args.validation_task_data) if args.validation_task_data else None
     )
-    if args.selection_metric == "exact_match" and task_records is None:
-        raise ValueError("exact_match selection requires --validation-task-data")
-    if task_records is not None:
-        known = indexed_records(validation_records)
-        if not indexed_records(task_records).keys() <= known.keys():
-            raise ValueError(
-                "Task validation IDs must be a subset of validation pair IDs"
-            )
-        for row in task_records:
-            if row["question_vi"].strip() != known[str(row["id"])]["vi"].strip():
-                raise ValueError(
-                    "Task validation questions must match their bilingual IDs"
-                )
+    validate_protocol(args, validation_records, task_records)
     provenance = run_provenance(
         args,
         {
             "train_pairs": args.train_pairs,
             "validation_pairs": args.validation_pairs,
             "validation_task_data": args.validation_task_data,
+            "init_checkpoint": args.init_checkpoint,
         },
     )
     train_loader = make_loader(train_records, args.batch_size, True, args.seed)
     validation_loader = make_loader(
         validation_records, args.batch_size, False, args.seed
     )
+
+    config = {
+        "input_embedding_dim": 768,
+        "output_embedding_dim": 768,
+        "hidden_dim": args.hidden_dim,
+        "num_encoder_layers": args.encoder_layers,
+        "num_decoder_layers": args.decoder_layers,
+        "num_heads": args.heads,
+        "dropout": args.dropout,
+        "max_seq_length": args.max_length,
+    }
+    adapter = EmbeddingTransferAdapter(**config).to(device)
+    initialization = initialize_adapter(adapter, config, args, provenance)
+    provenance["initialization"] = initialization
 
     source_tokenizer = BertTokenizer.from_pretrained(
         SOURCE_MODEL, local_files_only=args.local_files_only
@@ -226,17 +341,6 @@ def main() -> None:
     target_embeddings = freeze(target_model.text_encoder.embeddings.to(device))
     del source_model
 
-    config = {
-        "input_embedding_dim": 768,
-        "output_embedding_dim": 768,
-        "hidden_dim": args.hidden_dim,
-        "num_encoder_layers": args.encoder_layers,
-        "num_decoder_layers": args.decoder_layers,
-        "num_heads": args.heads,
-        "dropout": args.dropout,
-        "max_seq_length": args.max_length,
-    }
-    adapter = EmbeddingTransferAdapter(**config).to(device)
     predictor = None
     if task_records is not None:
         from embedding_transfer.vivqa import ViVQAPredictor
@@ -339,6 +443,8 @@ def main() -> None:
                     "adapter_state_dict": adapter.state_dict(),
                     "metadata": {
                         "seed": args.seed,
+                        "training_stage": args.training_stage,
+                        "initialization": initialization,
                         "selected_epoch": epoch,
                         "selection_split": "validation",
                         "selection_metric": args.selection_metric,
@@ -349,6 +455,10 @@ def main() -> None:
                         "target_model": TARGET_MODEL,
                         "train_pairs": len(train_records),
                         "validation_pairs": len(validation_records),
+                        "validation_task_count": len(task_records)
+                        if task_records is not None
+                        else 0,
+                        "validation_task_scope": args.validation_task_scope,
                         "history": history,
                     },
                 },
@@ -357,7 +467,7 @@ def main() -> None:
         else:
             stale_epochs += 1
         save_history(args.output, provenance, history, selected_epoch)
-        if stale_epochs:
+        if args.early_stopping and stale_epochs:
             if stale_epochs >= args.patience:
                 print(f"stopped after {args.patience} epochs without improvement")
                 break
@@ -373,13 +483,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-task-data", type=Path)
     parser.add_argument("--validation-image-root", type=Path, default=Path("."))
     parser.add_argument(
+        "--validation-task-scope",
+        choices=("subset", "full"),
+        default="subset",
+        help="Task validation scope.",
+    )
+    parser.add_argument(
+        "--expected-validation-count",
+        type=int,
+        help="Expected number of task validation records.",
+    )
+    parser.add_argument(
         "--selection-metric",
         choices=("alignment_loss", "exact_match"),
         default="alignment_loss",
     )
     parser.add_argument("--output", type=Path, default=Path("outputs/vivqa_adapter.pt"))
+    parser.add_argument(
+        "--training-stage",
+        choices=("standalone", "stage1", "stage2"),
+        default="standalone",
+        help="Training stage.",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        help="Checkpoint for initializing adapter weights.",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument(
+        "--early-stopping", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gradient-accumulation", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-4)

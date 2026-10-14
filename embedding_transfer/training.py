@@ -1,4 +1,4 @@
-"""Small training utilities shared by the two released trainers."""
+"""Shared training utilities."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 
 class AlignmentLoss(nn.Module):
-    """Five-term embedding alignment objective used in the paper."""
+    """Embedding alignment loss."""
 
     def __init__(
         self,
@@ -199,21 +199,28 @@ def load_mocheg_jsonl(path: str | Path, max_evidence: int = 5) -> list[dict]:
         if len(evidence_vi) != len(evidence_en) or not evidence_vi:
             raise ValueError(f"{source} requires equal nonempty evidence lists")
         pairs = []
-        for position, (vi, en) in enumerate(
-            zip(evidence_vi[:max_evidence], evidence_en[:max_evidence]), 1
-        ):
+        for position, (vi, en) in enumerate(zip(evidence_vi, evidence_en), 1):
             pair_source = f"{source} evidence {position}"
+            if (
+                isinstance(vi, str)
+                and isinstance(en, str)
+                and not vi.strip()
+                and not en.strip()
+            ):
+                continue
             pairs.append(
                 {
                     "vi": _text({"vi": vi}, "vi", pair_source),
                     "en": _text({"en": en}, "en", pair_source),
                 }
             )
+        if not pairs:
+            raise ValueError(f"{source} requires at least one nonempty evidence pair")
         result.append(
             {
                 "vi": _text(record, "claim_vi", source),
                 "en": _text(record, "claim_en", source),
-                "evidence": pairs,
+                "evidence": pairs[:max_evidence],
                 **({"id": record["id"]} if "id" in record else {}),
             }
         )
@@ -306,7 +313,7 @@ def save_payload(payload: dict, output: str | Path) -> None:
 
 
 def make_plateau_scheduler(optimizer):
-    """Support losses and negated maximization metrics without treating ties as gains."""
+    """Create a learning rate scheduler."""
     return torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",

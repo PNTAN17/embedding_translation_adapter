@@ -1,4 +1,4 @@
-"""Frozen MOCHEG stance head expected by compatible checkpoints."""
+"""MOCHEG stance model components."""
 
 from __future__ import annotations
 
@@ -113,4 +113,12 @@ class TextImageStance(nn.Module):
         if images is None or image_count is None or bool((image_count == 0).all()):
             return self.classifier_text(text)
         image = self._image_stance(claim, claim_mask, images, image_count)
-        return self.classifier(torch.cat([text, image], dim=-1))
+        multimodal_logits = self.classifier(torch.cat([text, image], dim=-1))
+        # A claim with no images must use the same head when evaluated alone
+        # or alongside claims that do have images. Keep checkpoint weights and
+        # the established per-claim inference behavior unchanged.
+        return torch.where(
+            (image_count > 0).unsqueeze(1),
+            multimodal_logits,
+            self.classifier_text(text),
+        )

@@ -1,0 +1,4 @@
+# Optional dependencies for generate_pairs.py, including its dry run mode.
+filelock>=3.13,<4
+openai>=2,<3
+google-genai>=1,<2

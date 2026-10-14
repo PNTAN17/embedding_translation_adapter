@@ -1,4 +1,4 @@
-"""Training and inference package for Vietnamese embedding-space transfer."""
+"""Embedding transfer utilities."""
 
 __all__ = ["EmbeddingTransferAdapter", "MOCHEGPredictor", "ViVQAPredictor"]
 

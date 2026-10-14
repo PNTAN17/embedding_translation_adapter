@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Generate Vietnamese to English parallel pairs with Gemini or OpenAI."""
+"""Generate bilingual text pairs."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.metadata
 import json
+import math
 import os
 import random
 import sys
@@ -38,11 +39,11 @@ SYSTEM_PROMPT = (
 
 
 class TranslationFailure(RuntimeError):
-    """An API item failed without exposing provider error details."""
+    """A translation request failed."""
 
 
 class FatalProviderFailure(RuntimeError):
-    """A provider configuration failure that should stop the whole run."""
+    """The provider configuration is invalid."""
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -51,7 +52,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model",
         required=True,
-        help="Exact provider model ID, for example gemini-2.5-flash",
+        help="Provider model ID.",
     )
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -65,12 +66,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--limit",
         type=int,
         default=0,
-        help="Translate at most this many pending rows. Zero means all rows.",
+        help="Maximum pending rows to process; 0 means all.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate files and report pending rows without calling an API.",
+        help="Check inputs without API calls.",
     )
     return parser.parse_args(argv)
 
@@ -122,7 +123,13 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in ("workers", "max_attempts", "save_every", "max_output_tokens"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
-    if args.retry_delay < 0 or args.limit < 0 or args.request_timeout <= 0:
+    if (
+        not math.isfinite(args.retry_delay)
+        or not math.isfinite(args.request_timeout)
+        or args.retry_delay < 0
+        or args.limit < 0
+        or args.request_timeout <= 0
+    ):
         raise ValueError(
             "retry-delay and limit cannot be negative and request-timeout "
             "must be positive"
@@ -174,7 +181,7 @@ def resumed_rows(source: list[dict], output: Path) -> list[dict]:
 
 
 def recover_transaction(output: Path) -> None:
-    """Finish a checkpoint interrupted between output and metadata replacement."""
+    """Recover an interrupted save."""
     marker = transaction_path(output)
     if not marker.exists():
         return
@@ -253,6 +260,24 @@ def clean_translation(value: object) -> str:
     return value.strip()
 
 
+def completed_openai_translation(response: object) -> str:
+    """Extract a completed translation."""
+    if getattr(response, "status", None) != "completed":
+        raise ValueError("The provider did not complete the translation")
+    return clean_translation(getattr(response, "output_text", None))
+
+
+def completed_gemini_translation(response: object) -> str:
+    """Extract a completed translation."""
+    candidates = getattr(response, "candidates", None)
+    if not candidates:
+        raise ValueError("The provider returned no completed translation")
+    reason = getattr(candidates[0], "finish_reason", None)
+    if getattr(reason, "value", reason) != "STOP":
+        raise ValueError("The provider did not complete the translation")
+    return clean_translation(getattr(response, "text", None))
+
+
 def package_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -329,7 +354,7 @@ def build_translator(
                 max_output_tokens=args.max_output_tokens,
             )
             observe_model_version(getattr(response, "model", None))
-            return clean_translation(response.output_text)
+            return completed_openai_translation(response)
 
         return (
             translate,
@@ -366,7 +391,7 @@ def build_translator(
             ),
         )
         observe_model_version(getattr(response, "model_version", None))
-        return clean_translation(response.text)
+        return completed_gemini_translation(response)
 
     return (
         translate,
@@ -596,9 +621,7 @@ def _run_locked(
         ) = build_translator(args, recorded_versions)
         sdk_version = detected_version
     created_at = (
-        str(saved_metadata.get("created_at_utc"))
-        if saved_metadata
-        else utc_now()
+        str(saved_metadata.get("created_at_utc")) if saved_metadata else utc_now()
     )
     sdk_version = sdk_version or "test-double"
     if saved_metadata and saved_metadata.get("sdk_version") != sdk_version:
@@ -656,10 +679,7 @@ def _run_locked(
                     consecutive_failures = 0
                 else:
                     consecutive_failures += batch_failures
-                if (
-                    fatal_error is None
-                    and consecutive_failures >= max(3, args.workers)
-                ):
+                if fatal_error is None and consecutive_failures >= max(3, args.workers):
                     fatal_error = FatalProviderFailure(
                         "Repeated request failures stopped the generation job"
                     )

@@ -1,4 +1,4 @@
-"""Validate existing partitions, remove training overlaps, and save original IDs."""
+"""Prepare datasets for training and evaluation."""
 
 import argparse
 from pathlib import Path

@@ -1,0 +1,23 @@
+{
+  "training_stage": "stage2",
+  "init_checkpoint": "outputs/vivqa_stage1_seed42.pt",
+  "selection_metric": "exact_match",
+  "validation_task_scope": "full",
+  "expected_validation_count": 5000,
+  "epochs": 30,
+  "early_stopping": true,
+  "patience": 10,
+  "batch_size": 256,
+  "gradient_accumulation": 2,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.01,
+  "hidden_dim": 1280,
+  "encoder_layers": 4,
+  "decoder_layers": 2,
+  "heads": 16,
+  "dropout": 0.1,
+  "max_length": 32,
+  "seed": 42,
+  "amp": true,
+  "output": "outputs/vivqa_stage2_seed42.pt"
+}

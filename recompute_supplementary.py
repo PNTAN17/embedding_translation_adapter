@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
-"""Recompute ViVQA supplementary diagnostics from retained per item predictions.
-
-Run from the research workspace with
-python github_release/embedding_translation_adapter/recompute_supplementary.py \
-    --workspace-root . --output-dir revision/experiments/vivqa_supplementary_recomputed
-
-This command rescores explicitly supplied predictions and verifies their hash
-against the evaluation record. It never selects a checkpoint using test scores.
-The default inputs are retained predictions for the checkpoint identified by
-the authors for the current controlled protocol. Author confirmation of run
-membership is recorded separately from artifact verification through
---checkpoint-provenance. To analyse a fresh evaluation, pass its predictions.csv and
-result.json through --adapter-predictions and --adapter-record. The prediction
-CSV must retain img_id, type, question, answer_english, prediction and exact.
-The record must include predictions_sha256, checkpoint_sha256, test.samples and
-test.exact_accuracy. All input paths can be overridden. Image inference and
-tokenisation are not repeated by this rescoring command.
-"""
+"""Generate supplementary evaluation summaries."""
 
 from __future__ import annotations
 
@@ -24,6 +7,8 @@ import argparse
 import csv
 import hashlib
 import json
+import math
+import re
 import statistics
 from functools import lru_cache
 from importlib.metadata import version
@@ -34,7 +19,6 @@ from embedding_transfer.metrics import NORMALIZATION, normalize_answer, token_f1
 from scipy.stats import spearmanr
 
 TYPES = {0: "Object", 1: "Count", 2: "Colour", 3: "Location"}
-EXCLUDED_REPORTED_ACCURACIES = (0.4365,)
 
 
 def artifact(path: Path) -> dict:
@@ -51,7 +35,7 @@ def read_csv(path: Path) -> list[dict]:
 
 
 def align_rows(references: list[dict], rows: list[dict]) -> list[dict]:
-    """Retain duplicate questions and verify their original test row identity."""
+    """Align predictions with reference records."""
     if len(rows) != len(references):
         raise ValueError("Prediction and reference row counts differ")
     if not rows:
@@ -78,42 +62,85 @@ def align_rows(references: list[dict], rows: list[dict]) -> list[dict]:
     return rows
 
 
-def excluded_accuracy(value: float) -> bool:
-    return any(
-        abs(value - rejected) < 0.00005 for rejected in EXCLUDED_REPORTED_ACCURACIES
-    )
+def recorded_test_metrics(record: dict) -> tuple[int, float]:
+    """Read and validate evaluation metrics."""
+    if not isinstance(record, dict) or not isinstance(record.get("test"), dict):
+        raise ValueError("Evaluation record requires a test metrics object")
+    samples = record["test"].get("samples")
+    accuracy = record["test"].get("exact_accuracy")
+    if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
+        raise ValueError("Evaluation sample count must be a positive integer")
+    if (
+        isinstance(accuracy, bool)
+        or not isinstance(accuracy, (int, float))
+        or not math.isfinite(accuracy)
+        or not 0 <= accuracy <= 1
+    ):
+        raise ValueError("Evaluation exact accuracy must be a finite fraction")
+    return samples, float(accuracy)
 
 
-def verify_record(record: dict, predictions: Path, checkpoint: Path | None = None) -> None:
-    """Require exact artifact identity rather than a similar aggregate score."""
-    if excluded_accuracy(float(record["test"]["exact_accuracy"])):
-        raise ValueError("The rejected 0.4365 run must not enter supplementary diagnostics")
+def verify_record(
+    record: dict, predictions: Path, checkpoint: Path | None = None
+) -> None:
+    """Verify evaluation artifacts."""
+    recorded_test_metrics(record)
+    for name in ("predictions_sha256", "checkpoint_sha256"):
+        value = record.get(name)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"Evaluation record requires a SHA256 value in {name}")
     if artifact(predictions)["sha256"] != record["predictions_sha256"]:
         raise ValueError("Prediction hash differs from the retained evaluation record")
-    if checkpoint is not None and artifact(checkpoint)["sha256"] != record["checkpoint_sha256"]:
+    if (
+        checkpoint is not None
+        and artifact(checkpoint)["sha256"] != record["checkpoint_sha256"]
+    ):
         raise ValueError("Checkpoint hash differs from the retained evaluation record")
 
 
 def verify_scores(record: dict, exact: np.ndarray) -> None:
-    if len(exact) != record["test"]["samples"] or abs(
-        float(exact.mean()) - record["test"]["exact_accuracy"]
-    ) > 1e-12:
-        raise ValueError("Recomputed exact match or sample count differs from the evaluation record")
-    if excluded_accuracy(float(exact.mean())):
-        raise ValueError("The rejected 0.4365 run must not enter supplementary diagnostics")
+    samples, accuracy = recorded_test_metrics(record)
+    exact = np.asarray(exact, dtype=float)
+    if exact.ndim != 1 or not len(exact) or not np.isin(exact, [0, 1]).all():
+        raise ValueError(
+            "Recomputed exact match values must be a nonempty binary array"
+        )
+    if len(exact) != samples or abs(float(exact.mean()) - accuracy) > 1e-12:
+        raise ValueError(
+            "Recomputed exact match or sample count differs from the evaluation record"
+        )
 
 
 def checkpoint_provenance(path: Path | None, checkpoint_sha256: str) -> dict:
-    """Keep an author's run identification separate from measured artifact identity."""
+    """Load checkpoint provenance."""
     if path is None:
-        return {"basis": "not_supplied", "training_records_independently_audited": False}
+        return {
+            "basis": "not_supplied",
+            "training_records_independently_audited": False,
+        }
     value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("checkpoint_sha256") != checkpoint_sha256:
+    if (
+        not isinstance(value, dict)
+        or value.get("checkpoint_sha256") != checkpoint_sha256
+    ):
         raise ValueError("Controlled run provenance refers to a different checkpoint")
-    membership = value["controlled_run_membership"]
-    if membership.get("basis") != "author_confirmation" or not membership.get("statement"):
+    membership = value.get("controlled_run_membership")
+    if (
+        not isinstance(membership, dict)
+        or membership.get("basis") != "author_confirmation"
+        or not isinstance(membership.get("statement"), str)
+        or not membership["statement"].strip()
+    ):
         raise ValueError("Run membership needs an explicit author confirmation")
-    return {**membership, "record": artifact(path)}
+    if membership.get("training_records_independently_audited", False) is not False:
+        raise ValueError(
+            "Author confirmation does not independently audit training records"
+        )
+    return {
+        **membership,
+        "training_records_independently_audited": False,
+        "record": artifact(path),
+    }
 
 
 def score_rows(
@@ -122,6 +149,10 @@ def score_rows(
     prediction_column: str,
     normalizer=normalize_answer,
 ) -> dict:
+    if len(references) != len(rows) or not references:
+        raise ValueError(
+            "Scoring requires the same nonzero number of references and predictions"
+        )
     normalizer = lru_cache(maxsize=None)(normalizer)
     pairs = [
         (normalizer(row[prediction_column]), normalizer(ref["answer_english"]))
@@ -233,7 +264,7 @@ def tokenisation_summary(
 
 
 def baseline_controls(references: list[dict], directory: Path) -> dict:
-    """Rescore the fixed baseline runs without importing historical adapters."""
+    """Evaluate baseline predictions."""
     locations = {
         "input_linear": "vivqa_adapter_baselines_controlled_30epoch/linear_seed",
         "input_mlp": "vivqa_adapter_baselines_controlled_30epoch/mlp_seed",
@@ -263,10 +294,7 @@ def baseline_controls(references: list[dict], directory: Path) -> dict:
                     f"Baseline normalization mismatch for {method} seed {seed}"
                 )
             value = float(score["exact"].mean())
-            if abs(value - record["test"]["exact_accuracy"]) > 1e-12:
-                raise ValueError(
-                    f"Baseline aggregate mismatch for {method} seed {seed}"
-                )
+            verify_scores(record, score["exact"])
             runs.append(
                 {
                     "seed": seed,
@@ -327,7 +355,7 @@ def write_tables(summary: dict, destination: Path) -> None:
 
 
 def write_diagnostics(summary: dict, destination: Path) -> None:
-    """Generate the paper fragment from the same metrics as the JSON export."""
+    """Write a diagnostics report."""
     overall = summary["groups"]["Overall"]
     adapter = overall["methods"]["adapter"]
     gemini = overall["methods"]["gemini"]
@@ -345,7 +373,9 @@ def write_diagnostics(summary: dict, destination: Path) -> None:
         "Tables~\\ref{tab:supp-qtype-em} and~\\ref{tab:supp-qtype-f1} report these metrics "
         "by question type and include the Qwen translation pipeline. Differences are "
         "paired adapter minus Gemini values in percentage points. Each interval uses "
-        "$" + f"{summary['bootstrap']['samples']:,}".replace(",", "{,}") + rf"$ paired bootstrap samples with seed ${summary['bootstrap']['seed']}$. "
+        "$"
+        + f"{summary['bootstrap']['samples']:,}".replace(",", "{,}")
+        + rf"$ paired bootstrap samples with seed ${summary['bootstrap']['seed']}$. "
         rf"Across all test items, the paired Token F1 difference is ${delta['mean'] * 100:.2f}$ points "
         rf"with a $95\%$ interval of $[{delta['ci95'][0] * 100:.2f},{delta['ci95'][1] * 100:.2f}]$."
         "\n\n"
@@ -378,12 +408,14 @@ def main() -> None:
     parser.add_argument("--workspace-root", type=Path, default=Path("."))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
-        "--saved-summary", type=Path,
-        help="Render a saved summary without rerunning inference, metrics or bootstrap",
+        "--saved-summary",
+        type=Path,
+        help="Saved summary to render.",
     )
     parser.add_argument(
-        "--paper-output-dir", type=Path,
-        help="Also write the generated ViVQA diagnostics fragment in this paper directory",
+        "--paper-output-dir",
+        type=Path,
+        help="Directory for report output.",
     )
     for name in (
         "data",
@@ -397,30 +429,33 @@ def main() -> None:
     parser.add_argument(
         "--baseline-root",
         type=Path,
-        help="Optionally rescore the five repeated baseline methods",
+        help="Directory containing baseline predictions.",
     )
     parser.add_argument(
-        "--adapter-checkpoint", type=Path,
-        help="Optional original checkpoint, verified by SHA256 against the record",
+        "--adapter-checkpoint",
+        type=Path,
+        help="Checkpoint to verify.",
     )
     parser.add_argument(
-        "--checkpoint-provenance", type=Path,
-        help="Author confirmation of controlled run membership tied to checkpoint SHA256",
+        "--checkpoint-provenance",
+        type=Path,
+        help="Checkpoint provenance record.",
     )
     parser.add_argument(
-        "--token-count-record", type=Path,
-        help="Fresh tokenisation record with token_counts_sha256 and data_sha256",
+        "--token-count-record",
+        type=Path,
+        help="Token count metadata record.",
     )
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=2026)
     args = parser.parse_args()
     if args.saved_summary:
         summary = json.loads(args.saved_summary.read_text(encoding="utf-8"))
-        if excluded_accuracy(summary["groups"]["Overall"]["methods"]["adapter"]["exact"]["mean"]):
-            raise ValueError("The rejected 0.4365 run must not enter supplementary diagnostics")
         for saved in summary["inputs"].values():
             if artifact(Path(saved["path"]))["sha256"] != saved["sha256"]:
-                raise ValueError(f"Saved summary input hash changed for {saved['path']}")
+                raise ValueError(
+                    f"Saved summary input hash changed for {saved['path']}"
+                )
         provenance = {
             "saved_summary": artifact(args.saved_summary),
             "renderer": artifact(Path(__file__)),
@@ -433,10 +468,14 @@ def main() -> None:
             ),
             "note": "Render saved diagnostic metrics only. Run membership follows the separately recorded author confirmation; numerical checks verify artifact identity and scores.",
         }
-        for destination in [args.output_dir] + ([args.paper_output_dir] if args.paper_output_dir else []):
+        for destination in [args.output_dir] + (
+            [args.paper_output_dir] if args.paper_output_dir else []
+        ):
             destination.mkdir(parents=True, exist_ok=True)
             write_diagnostics(summary, destination / "vivqa_diagnostics.tex")
-            (destination / "render_provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+            (destination / "render_provenance.json").write_text(
+                json.dumps(provenance, indent=2) + "\n"
+            )
         print(json.dumps(provenance, indent=2))
         return
     root = args.workspace_root.resolve()
@@ -453,7 +492,9 @@ def main() -> None:
         for name, relative in defaults.items()
     }
     references = read_csv(paths["data"])
-    if len(references) != 3001 or {int(row["type"]) for row in references} != set(TYPES):
+    if len(references) != 3001 or {int(row["type"]) for row in references} != set(
+        TYPES
+    ):
         raise ValueError(
             "Expected all 3001 test items with the four documented question types"
         )
@@ -506,12 +547,13 @@ def main() -> None:
         },
         "prediction_provenance": {
             "rule": "Explicit prediction file and its hash-verified evaluation record; no selection by test score",
-            "excluded_reported_accuracies": list(EXCLUDED_REPORTED_ACCURACIES),
             "recorded_seed": record.get("seed"),
             "recorded_selection_metric": record.get("selection_metric"),
             "original_checkpoint_sha256": record["checkpoint_sha256"],
             "original_checkpoint_hash_verified": args.adapter_checkpoint is not None,
-            "original_checkpoint": artifact(args.adapter_checkpoint) if args.adapter_checkpoint else None,
+            "original_checkpoint": artifact(args.adapter_checkpoint)
+            if args.adapter_checkpoint
+            else None,
             "controlled_run_membership": checkpoint_provenance(
                 args.checkpoint_provenance, record["checkpoint_sha256"]
             ),
@@ -520,10 +562,7 @@ def main() -> None:
             "second_saved_prediction_export_differing_rows": alternate_differences,
             "adapter_prediction_source": "Only the prediction file whose hash matches adapter_record is used for every adapter diagnostic",
         },
-        "inputs": {
-            name: artifact(path)
-            for name, path in paths.items()
-        },
+        "inputs": {name: artifact(path) for name, path in paths.items()},
         "groups": summarise(
             references, scores, args.bootstrap_samples, args.bootstrap_seed
         ),
@@ -540,15 +579,24 @@ def main() -> None:
     if args.token_count_record:
         count_record = json.loads(args.token_count_record.read_text(encoding="utf-8"))
         if (
-            count_record["token_counts_sha256"] != artifact(paths["token_counts"])["sha256"]
+            count_record["token_counts_sha256"]
+            != artifact(paths["token_counts"])["sha256"]
             or count_record["data_sha256"] != artifact(paths["data"])["sha256"]
         ):
-            raise ValueError("Token count record does not identify the supplied counts and test split")
-        summary["tokenisation"]["tokenisation_rerun"] = bool(count_record["tokenisation_rerun"])
-        summary["tokenisation"]["source"] = "Fresh mBERT and BLIP token counts verified against test questions and the tokenisation record"
+            raise ValueError(
+                "Token count record does not identify the supplied counts and test split"
+            )
+        summary["tokenisation"]["tokenisation_rerun"] = bool(
+            count_record["tokenisation_rerun"]
+        )
+        summary["tokenisation"]["source"] = (
+            "Fresh mBERT and BLIP token counts verified against test questions and the tokenisation record"
+        )
         summary["inputs"]["token_count_record"] = artifact(args.token_count_record)
     if args.checkpoint_provenance:
-        summary["inputs"]["checkpoint_provenance"] = artifact(args.checkpoint_provenance)
+        summary["inputs"]["checkpoint_provenance"] = artifact(
+            args.checkpoint_provenance
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -583,7 +631,9 @@ def main() -> None:
         "inference_executed_by_this_command": False,
         "training_rerun": False,
         "input_hashes_verified": True,
-        "controlled_run_membership": summary["prediction_provenance"]["controlled_run_membership"],
+        "controlled_run_membership": summary["prediction_provenance"][
+            "controlled_run_membership"
+        ],
     }
     (args.output_dir / "render_provenance.json").write_text(
         json.dumps(render_record, indent=2) + "\n", encoding="utf-8"

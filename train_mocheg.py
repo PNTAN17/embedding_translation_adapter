@@ -1,4 +1,4 @@
-"""Train the MOCHEG embedding adapter from prepared bilingual JSONL files."""
+"""Train the MOCHEG adapter."""
 
 from __future__ import annotations
 
@@ -207,9 +207,45 @@ def validate(
     return total / samples
 
 
+def validate_output_paths(args) -> None:
+    """Validate output paths."""
+    requested_output = Path(args.output).expanduser()
+    checkpoint = requested_output.resolve()
+    history = requested_output.with_suffix(".run.json")
+    destinations = [
+        checkpoint,
+        checkpoint.with_suffix(checkpoint.suffix + ".tmp"),
+        history,
+        history.with_suffix(history.suffix + ".tmp"),
+    ]
+    for name in (
+        "train_pairs",
+        "validation_pairs",
+        "validation_task_data",
+        "phomt_train",
+        "config",
+        "stance_checkpoint",
+    ):
+        value = getattr(args, name, None)
+        if value is None:
+            continue
+        source = Path(value).expanduser().resolve()
+        for destination in destinations:
+            destination = destination.resolve()
+            if destination == source or (
+                destination.exists()
+                and source.exists()
+                and destination.samefile(source)
+            ):
+                raise ValueError(
+                    f"Output checkpoint, run record, or temporary file would overwrite {name}"
+                )
+
+
 def main() -> None:
     args = parse_config(build_parser())
     validate_training_args(args)
+    validate_output_paths(args)
     if args.patience < 1:
         raise ValueError("patience must be positive")
     seed_everything(args.seed)
@@ -227,16 +263,24 @@ def main() -> None:
         raise ValueError("micro_macro_f1_sum selection requires --validation-task-data")
     if task_records is not None:
         known = indexed_records(validation_records)
-        if not indexed_records(task_records).keys() <= known.keys():
+        task_ids = indexed_records(task_records).keys()
+        if not task_ids <= known.keys():
             raise ValueError(
                 "Task validation IDs must be a subset of validation pair IDs"
+            )
+        if args.selection_metric == "micro_macro_f1_sum" and task_ids != known.keys():
+            raise ValueError(
+                "micro_macro_f1_sum selection requires every validation pair ID"
             )
         for row in task_records:
             if row["claim_vi"].strip() != known[str(row["id"])]["vi"].strip():
                 raise ValueError(
                     "Task validation claims must match their bilingual IDs"
                 )
-            if [item.strip() for item in row["evidence_vi"][: args.max_evidence]] != [
+            retained_evidence = [
+                item.strip() for item in row["evidence_vi"] if item.strip()
+            ][: args.max_evidence]
+            if retained_evidence != [
                 pair["vi"] for pair in known[str(row["id"])]["evidence"]
             ]:
                 raise ValueError(
@@ -425,7 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--stance-checkpoint",
         type=Path,
         required=True,
-        help="Compatible checkpoint containing the frozen stance state.",
+        help="Stance model checkpoint.",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("outputs/mocheg_adapter.pt")

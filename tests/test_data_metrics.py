@@ -84,6 +84,8 @@ class DataMetricTests(unittest.TestCase):
             references, predictions, "vivqa", normalizer=lambda value: value
         )
         self.assertEqual(result["exact_match"], 50)
+        self.assertEqual(result["exact_match_correct"], 1)
+        self.assertEqual(result["count"], 2)
         self.assertAlmostEqual(result["token_f1"], 100 * (1 + 2 / 3) / 2)
         with self.assertRaises(ValueError):
             score_records(references, predictions[:1], "vivqa")
@@ -101,6 +103,7 @@ class DataMetricTests(unittest.TestCase):
         ]
         result = score_records(references, predictions, "mocheg")
         self.assertEqual(result["micro_f1"], 50)
+        self.assertEqual(result["micro_f1_correct"], 1)
         self.assertAlmostEqual(result["macro_f1"], 100 * (2 / 3) / 3)
 
     def test_config_overrides_and_complete_history(self):
@@ -119,6 +122,22 @@ class DataMetricTests(unittest.TestCase):
             result = json.loads((root / "best.run.json").read_text())
             self.assertEqual(result["selected_epoch"], 1)
             self.assertEqual(len(result["history"]), 2)
+
+    def test_config_rejects_silent_integer_conversion_and_nonfinite_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            for key, value in (
+                ("epochs", 30.9),
+                ("epochs", True),
+                ("learning_rate", "nan"),
+            ):
+                with self.subTest(key=key, value=value):
+                    path.write_text(json.dumps({key: value}))
+                    parser = argparse.ArgumentParser()
+                    parser.add_argument("--epochs", type=int)
+                    parser.add_argument("--learning-rate", type=float)
+                    with self.assertRaises(ValueError):
+                        parse_config(parser, ["--config", str(path)])
 
 
 if __name__ == "__main__":

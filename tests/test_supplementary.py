@@ -55,10 +55,44 @@ class SupplementaryTests(unittest.TestCase):
         self.assertEqual(result["ci95"], [0, 0])
         self.assertEqual(result, bootstrap(adapter - identical_baseline, 100, 2026))
 
-    def test_rejected_run_cannot_be_rescored(self):
-        record = {"test": {"exact_accuracy": 0.436521}}
-        with self.assertRaises(ValueError):
-            verify_record(record, Path("unused.csv"))
+    def test_valid_run_is_not_rejected_by_its_accuracy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            predictions = Path(directory) / "predictions.csv"
+            predictions.write_text("prediction\nblue\n")
+            checkpoint = Path(directory) / "checkpoint.pt"
+            checkpoint.write_bytes(b"independently selected checkpoint")
+            record = {
+                "test": {"samples": 2000, "exact_accuracy": 0.4365},
+                "predictions_sha256": artifact(predictions)["sha256"],
+                "checkpoint_sha256": artifact(checkpoint)["sha256"],
+            }
+            verify_record(record, predictions, checkpoint)
+            verify_scores(record, np.asarray([1.0] * 873 + [0.0] * 1127))
+
+    def test_nonfinite_metrics_and_invalid_sample_counts_are_rejected(self):
+        for accuracy in (float("nan"), float("inf"), -0.1, 1.1, "0.5", True):
+            with self.subTest(accuracy=accuracy):
+                with self.assertRaises(ValueError):
+                    verify_scores(
+                        {"test": {"samples": 2, "exact_accuracy": accuracy}},
+                        np.array([1, 0]),
+                    )
+        for samples in (0, -1, 2.0, "2", True):
+            with self.subTest(samples=samples):
+                with self.assertRaises(ValueError):
+                    verify_scores(
+                        {"test": {"samples": samples, "exact_accuracy": 0.5}},
+                        np.array([1, 0]),
+                    )
+
+    def test_prediction_scoring_does_not_silently_discard_extra_rows(self):
+        with self.assertRaisesRegex(ValueError, "same nonzero"):
+            score_rows(
+                self.references,
+                [{"prediction": "red"}],
+                "prediction",
+                normalizer=lambda text: text,
+            )
 
     def test_record_requires_exact_prediction_and_checkpoint_hashes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -91,19 +125,41 @@ class SupplementaryTests(unittest.TestCase):
     def test_author_confirmation_is_bound_to_checkpoint_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "provenance.json"
-            path.write_text(json.dumps({
-                "checkpoint_sha256": "accepted_hash",
-                "controlled_run_membership": {
-                    "basis": "author_confirmation",
-                    "statement": "One checkpoint from the current controlled runs.",
-                    "training_records_independently_audited": False,
-                },
-            }))
+            path.write_text(
+                json.dumps(
+                    {
+                        "checkpoint_sha256": "accepted_hash",
+                        "controlled_run_membership": {
+                            "basis": "author_confirmation",
+                            "statement": "One checkpoint from the current controlled runs.",
+                            "training_records_independently_audited": False,
+                        },
+                    }
+                )
+            )
             value = checkpoint_provenance(path, "accepted_hash")
             self.assertEqual(value["basis"], "author_confirmation")
             self.assertFalse(value["training_records_independently_audited"])
             with self.assertRaises(ValueError):
                 checkpoint_provenance(path, "different_hash")
+
+    def test_author_confirmation_cannot_claim_an_independent_training_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "provenance.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "checkpoint_sha256": "accepted_hash",
+                        "controlled_run_membership": {
+                            "basis": "author_confirmation",
+                            "statement": "One checkpoint from the controlled runs.",
+                            "training_records_independently_audited": True,
+                        },
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "independently audit"):
+                checkpoint_provenance(path, "accepted_hash")
 
 
 if __name__ == "__main__":

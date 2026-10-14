@@ -10,11 +10,9 @@ ViVQA targets the complete BLIP input embedding module and passes its output
 through `encoder_embeds` to the frozen text encoder. MOCHEG targets final CLIP
 text states and passes its output directly to the frozen stance module.
 
-This working copy includes data checks, inference, evaluation, and adapter
-training with either alignment loss or downstream validation selection. It
-does not contain paper checkpoints, task data, translations, original paper
-split IDs, or historical run logs. See [ARTIFACTS.md](ARTIFACTS.md) for the public
-commit and the distinction between published files and these local changes.
+Use this repository to prepare data, train adapters, run inference, and
+evaluate saved predictions. Checkpoints are hosted on Hugging Face; see
+[ARTIFACTS.md](ARTIFACTS.md) for the repository link.
 
 ## Installation
 
@@ -28,14 +26,14 @@ pip install -r requirements.txt
 python -m nltk.downloader wordnet averaged_perceptron_tagger_eng punkt_tab
 ```
 
-The NLTK resources are needed for ViVQA answer normalization. Missing resources
-cause scoring to stop, so results never silently switch to another metric.
+The NLTK resources are needed when evaluating ViVQA answers.
 Transformers downloads frozen upstream weights on first use. Pass
 `--local-files-only` after the models have been cached for offline execution.
 
 ## Inference
 
-Supply a compatible checkpoint explicitly.
+Download a compatible checkpoint from the repository linked in
+[ARTIFACTS.md](ARTIFACTS.md), then pass its local file path to `--checkpoint`.
 
 ```bash
 python infer_vivqa.py \
@@ -69,11 +67,26 @@ python train_vivqa.py --help
 python train_mocheg.py --help
 ```
 
-[TRAINING.md](TRAINING.md) gives schemas and runnable commands. The example
-configurations enable validation Exact Match for ViVQA and the sum of
-development micro F1 and macro F1 for MOCHEG. The command line defaults retain
-alignment loss selection when task labels and images are unavailable. Neither
-mode certifies reproduction of the paper without its original artifacts.
+[TRAINING.md](TRAINING.md) gives input schemas and commands for data preparation,
+training, and evaluation. For ViVQA, run `configs/vivqa_stage1.json` first, then
+`configs/vivqa_stage2.json`. The Stage 2 configuration uses `init_checkpoint` to
+load `outputs/vivqa_stage1_seed42.pt`. Change that field or pass
+`--init-checkpoint /path/to/stage1.pt` when using a different checkpoint. Both
+stages require the same seed and data, including 5,000 validation records.
+
+## Translation generation
+
+Install optional dependencies before using the translation utility.
+
+```bash
+pip install -r requirements-generation.txt
+python generate_pairs.py --help
+```
+
+The utility translates user supplied Vietnamese records into English with
+Gemini or OpenAI. It records generation settings and file hashes for new runs,
+rejects incomplete provider output, and supports continuing unfinished files.
+Use its dry run mode to inspect inputs before making paid requests.
 
 ## Repository contents
 
@@ -82,12 +95,13 @@ mode certifies reproduction of the paper without its original artifacts.
 | `embedding_transfer` | Models, data validation, metrics, and provenance |
 | `prepare_data.py` | Validate partitions and record exact supplied IDs |
 | `evaluate.py` | Generate or score predictions |
+| `generate_pairs.py` | Translate supplied text and record new generation settings |
 | `train_vivqa.py` and `train_mocheg.py` | Adapter training and validation selection |
 | `infer_vivqa.py` and `infer_mocheg.py` | Single example inference |
 | `configs` | Executable reference settings and translation provenance template |
 | `tests` | Tests that use small synthetic inputs and no pretrained weights |
-| `ARTIFACTS.md` | Public version and outstanding release artifacts |
-| `MODEL_CARD.md` | Model scope and limitations |
+| `ARTIFACTS.md` | Hugging Face checkpoint repository |
+| `MODEL_CARD.md` | Model inputs, outputs, and checkpoint requirements |
 
 Run the tests after installing the dependencies.
 
@@ -106,6 +120,5 @@ No original, translated, or synthetic task samples are redistributed here.
 ## Citation and license
 
 Citation metadata is in [CITATION.cff](CITATION.cff). A source code license is
-not provided in this working copy or the verified public commit. No new reuse
-permission is implied by this
-working copy. Upstream models and datasets retain their own licenses.
+not provided in this working copy. No new reuse permission is implied by these
+changes. Upstream models and datasets retain their own licenses.
